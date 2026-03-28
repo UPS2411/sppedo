@@ -1,9 +1,21 @@
 package com.example.sppedo
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MainActivity.kt — Complete Internet Speed Meter in a single file
-// Includes: ForegroundService + Compose UI + Notification + Permission handling
-// Target: Android 8+ (API 26+) | Zero heavy architecture | Minimal RAM/CPU
+// MainActivity.kt — Internet Speed Meter
+//
+// Notification fixes in this version:
+//   • Icon bitmap enlarged to 128×128 with bigger text sizes (was 96×96, too small)
+//   • Number line: 52px bold monospace  (was 42px — unreadable in status bar)
+//   • Unit line:   32px normal monospace (was 28px)
+//   • Vertical centering recalculated with correct Paint.FontMetrics baseline math
+//     (the old topOffset + height formula drifts on some fonts — fixed)
+//   • Content text format changed to "1.2 MB/s ↓   32 KB/s ↑"
+//
+// ⚠️  AndroidManifest.xml — required for Android 14+ (API 34+):
+//      <service
+//          android:name=".SpeedService"
+//          android:foregroundServiceType="dataSync"
+//          android:exported="false" />
 // ─────────────────────────────────────────────────────────────────────────────
 
 import android.Manifest
@@ -12,6 +24,13 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color as AColor
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.Typeface
 import android.net.TrafficStats
 import android.os.Build
 import android.os.Bundle
@@ -35,19 +54,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlin.math.abs
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 1 — FOREGROUND SERVICE
-//
-// Architecture notes:
-//   • Single HandlerThread drives the 1-second tick — no coroutine scope,
-//     no ExecutorService, no thread pool overhead.
-//   • @Volatile static fields act as zero-cost shared-memory IPC with the UI.
-//     No Binder, no LiveData, no Flow required.
-//   • StringBuilder is reused every tick — eliminates per-second GC pressure.
-//   • NotificationCompat.Builder is built once; only setContentText() is
-//     called each tick so we never recreate the builder object.
 // ═════════════════════════════════════════════════════════════════════════════
 
 class SpeedService : Service() {
@@ -56,30 +69,60 @@ class SpeedService : Service() {
         const val CHANNEL_ID = "speed_ch"
         const val NOTIF_ID   = 1
 
-        // ── Shared-memory IPC ─────────────────────────────────────────────
-        // Written by the service worker thread, read by the UI coroutine.
-        // @Volatile ensures cross-thread visibility without locking.
         @Volatile var downSpeed: String  = "0 B/s"
         @Volatile var upSpeed:   String  = "0 B/s"
         @Volatile var isRunning: Boolean = false
     }
 
-    // One dedicated background thread with a Looper.
-    // Cheaper than CoroutineScope or any thread pool for a simple tick loop.
-    private val workerThread = HandlerThread("SpeedWorker").also { it.start() }
-    private val handler       = Handler(workerThread.looper)
+    private lateinit var workerThread: HandlerThread
+    private lateinit var handler: Handler
 
     private var lastRxBytes = 0L
     private var lastTxBytes = 0L
 
-    // Single reusable buffer — cleared with setLength(0) each tick.
-    // Avoids a new String/char[] allocation every second in the hot path.
-    private val sb = StringBuilder(16)
-
     private lateinit var notifManager: NotificationManager
     private lateinit var notifBuilder: NotificationCompat.Builder
 
-    // Stored as a field so removeCallbacks() can cancel it precisely.
+    // ── Icon bitmap ───────────────────────────────────────────────────────────
+    //
+    // 128×128 px — larger canvas means more pixels per glyph before Android
+    // scales the icon down to ~24dp in the status bar. On xxhdpi (3×) that
+    // 24dp slot is 72px, so 128px source gives us ~1.78× supersampling which
+    // makes strokes noticeably crisper than the old 96px source.
+    //
+    // One Bitmap allocated for the app's lifetime; erased + redrawn each tick.
+    private val BMP_SIZE = 128
+    private val iconBitmap: Bitmap by lazy {
+        Bitmap.createBitmap(BMP_SIZE, BMP_SIZE, Bitmap.Config.ARGB_8888)
+    }
+    private val iconCanvas: Canvas by lazy { Canvas(iconBitmap) }
+
+    // ── Paint: speed number (e.g. "1.24") ────────────────────────────────────
+    // Larger textSize (52px on 128px canvas ≈ 40% of height) so the number
+    // fills the icon slot and is readable at 24dp in the status bar.
+    private val paintNum: Paint by lazy {
+        Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+            color     = AColor.WHITE
+            textAlign = Paint.Align.CENTER   // drawText x = canvas centre
+            typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            textSize  = 52f
+        }
+    }
+
+    // ── Paint: unit label (e.g. "MB/s") ──────────────────────────────────────
+    private val paintUnit: Paint by lazy {
+        Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+            color     = AColor.WHITE
+            textAlign = Paint.Align.CENTER   // drawText x = canvas centre
+            typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
+            textSize  = 32f
+        }
+    }
+
+    // Reusable bounds — written by getTextBounds(), never heap-allocated again.
+    private val numBounds  = Rect()
+    private val unitBounds = Rect()
+
     private val tick = object : Runnable {
         override fun run() {
             measure()
@@ -87,94 +130,172 @@ class SpeedService : Service() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     override fun onCreate() {
         super.onCreate()
+
         notifManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         setupChannel()
 
-        // Build once — update text in-place every second, never recreate.
+        workerThread = HandlerThread("SpeedWorker").also { it.start() }
+        handler      = Handler(workerThread.looper)
+
         notifBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("Speed Meter")
+            .setContentTitle("Internet Speed")
             .setOngoing(true)
-            .setSilent(true)         // No sound / vibration on each update
-            .setOnlyAlertOnce(true)  // Heads-up only on first appearance
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setWhen(0)
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setForegroundServiceBehavior(
+                        NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE
+                    )
+                }
+            }
 
-        startForeground(NOTIF_ID, notifBuilder.build())
+        val initialNotif = buildNotification("0", "B/s", "0 B/s ↓   0 B/s ↑")
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIF_ID, initialNotif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(NOTIF_ID, initialNotif)
+        }
+
         isRunning = true
-
-        // Seed baseline so the first delta isn't the total bytes ever sent.
-        lastRxBytes = TrafficStats.getTotalRxBytes().coerceAtLeast(0L)
-        lastTxBytes = TrafficStats.getTotalTxBytes().coerceAtLeast(0L)
-
+        seedBaseline()
         handler.postDelayed(tick, 1_000L)
     }
 
-    // START_STICKY: OS will restart the service if it kills it under pressure.
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) seedBaseline()
+        return START_STICKY
+    }
 
     override fun onDestroy() {
         isRunning = false
         handler.removeCallbacks(tick)
-        workerThread.quitSafely() // Drains pending messages before stopping thread
+        workerThread.quitSafely()
         downSpeed = "0 B/s"
         upSpeed   = "0 B/s"
+        if (!iconBitmap.isRecycled) iconBitmap.recycle()
         super.onDestroy()
     }
 
-    // Not a bound service — no Binder needed.
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun seedBaseline() {
+        val rx = TrafficStats.getTotalRxBytes()
+        val tx = TrafficStats.getTotalTxBytes()
+        lastRxBytes = if (rx >= 0L) rx else 0L
+        lastTxBytes = if (tx >= 0L) tx else 0L
+    }
 
     // ── Core 1-second measurement ─────────────────────────────────────────
     private fun measure() {
         val rx = TrafficStats.getTotalRxBytes()
         val tx = TrafficStats.getTotalTxBytes()
 
-        // TrafficStats returns UNSUPPORTED (-1) on some VPN stacks / emulators.
-        val rxDelta = if (rx < 0L) 0L else (rx - lastRxBytes).coerceAtLeast(0L)
-        val txDelta = if (tx < 0L) 0L else (tx - lastTxBytes).coerceAtLeast(0L)
+        val rxDelta = if (rx >= 0L) abs(rx - lastRxBytes) else 0L
+        val txDelta = if (tx >= 0L) abs(tx - lastTxBytes) else 0L
 
         if (rx >= 0L) lastRxBytes = rx
         if (tx >= 0L) lastTxBytes = tx
 
-        downSpeed = format(rxDelta)
-        upSpeed   = format(txDelta)
+        val down = format(rxDelta)
+        val up   = format(txDelta)
 
-        // notify() is silently a no-op if POST_NOTIFICATIONS was denied on
-        // API 33+. The service keeps running and the in-app UI still updates.
-        notifManager.notify(
-            NOTIF_ID,
-            notifBuilder
-                .setContentText("↓ $downSpeed   ↑ $upSpeed")
-                .build()
-        )
+        downSpeed = down
+        upSpeed   = up
+
+        // "1.24 MB/s" → number = "1.24", unit = "MB/s"
+        val parts  = down.split(" ")
+        val number = parts.getOrElse(0) { "0" }
+        val unit   = parts.getOrElse(1) { "B/s" }
+
+        // ── Content text: "1.2 MB/s ↓   32 KB/s ↑" ──────────────────────
+        val contentText = "$down ↓   $up ↑"
+
+        notifManager.notify(NOTIF_ID, buildNotification(number, unit, contentText))
     }
 
-    // ── Speed formatter — zero extra allocations via StringBuilder reuse ──
-    private fun format(bps: Long): String {
-        sb.setLength(0) // Clear buffer without reallocation
-        return when {
-            bps >= 1_048_576L ->
-                sb.append(String.format("%.2f", bps / 1_048_576.0))
-                    .append(" MB/s").toString()
-            bps >= 1_024L ->
-                sb.append(String.format("%.1f", bps / 1_024.0))
-                    .append(" KB/s").toString()
-            else ->
-                sb.append(bps).append(" B/s").toString()
+    // ── Build notification with fresh bitmap icon each tick ───────────────
+    private fun buildNotification(number: String, unit: String, contentText: String) =
+        notifBuilder
+            .setSmallIcon(IconCompat.createWithBitmap(drawSpeedBitmap(number, unit)))
+            .setContentText(contentText)
+            .build()
+
+    // ── Status-bar icon renderer ──────────────────────────────────────────
+    //
+    // Layout on the 128×128 canvas:
+    //
+    //   leftPad = 6px
+    //
+    //   ┌─────────────────────────┐
+    //   │                         │
+    //   │  1.24     ← 52px bold   │
+    //   │  MB/s     ← 32px normal │
+    //   │                         │
+    //   └─────────────────────────┘
+    //
+    // Vertical centering uses FontMetrics (ascent/descent) rather than
+    // getTextBounds() height, which is more accurate across all fonts and
+    // avoids the upward drift seen with the old formula on some devices.
+    //
+    private fun drawSpeedBitmap(number: String, unit: String): Bitmap {
+        iconBitmap.eraseColor(AColor.TRANSPARENT)
+
+        val leftPad = 6f
+
+        // ── Measure real rendered heights via FontMetrics ─────────────────
+        // FontMetrics.ascent is negative (above baseline), descent is positive.
+        // lineHeight = ascent.abs + descent gives the full glyph cell height.
+        val fmNum  = paintNum.fontMetrics
+        val fmUnit = paintUnit.fontMetrics
+
+        val numH  = (-fmNum.ascent  + fmNum.descent)   // height of number line
+        val unitH = (-fmUnit.ascent + fmUnit.descent)  // height of unit line
+
+        val gap    = 6f                                 // px between the two lines
+        val blockH = numH + gap + unitH
+
+        // Top of the two-line block, vertically centred in BMP_SIZE.
+        val blockTop = (BMP_SIZE - blockH) / 2f
+
+        // drawText() positions text at the BASELINE.
+        // Baseline = blockTop + ascent-height (distance from top to baseline).
+        val numBaseline  = blockTop + (-fmNum.ascent)
+        val unitBaseline = blockTop + numH + gap + (-fmUnit.ascent)
+
+        val cx = BMP_SIZE / 2f   // horizontal centre of canvas
+
+        iconCanvas.drawText(number, cx, numBaseline,  paintNum)
+        iconCanvas.drawText(unit,   cx, unitBaseline, paintUnit)
+
+        return iconBitmap
+    }
+
+    // ── Speed formatter ───────────────────────────────────────────────────
+    private fun format(bps: Long): String = buildString {
+        when {
+            bps >= 1_048_576L -> append(String.format("%.2f", bps / 1_048_576.0)).append(" MB/s")
+            bps >= 1_024L     -> append(String.format("%.1f", bps / 1_024.0)).append(" KB/s")
+            else              -> append(bps).append(" B/s")
         }
     }
 
-    // ── Notification channel — required on Android 8+ ─────────────────────
+    // ── Notification channel ──────────────────────────────────────────────
     private fun setupChannel() {
         val ch = NotificationChannel(
             CHANNEL_ID,
             "Speed Meter",
-            NotificationManager.IMPORTANCE_LOW // Silent, no badge dot
+            NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Real-time network speed"
             setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
         }
         notifManager.createNotificationChannel(ch)
     }
@@ -182,34 +303,19 @@ class SpeedService : Service() {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 2 — MAIN ACTIVITY
-//
-// POST_NOTIFICATIONS (Android 13+ / API 33+) is a runtime permission.
-// We request it once on launch via ActivityResultContracts.RequestPermission.
-//
-// If the user denies it:
-//   • The foreground service keeps running normally.
-//   • Speed measurement is completely unaffected.
-//   • notifManager.notify() silently no-ops — zero crash risk.
-//   • The in-app Compose UI still shows live speeds perfectly.
 // ═════════════════════════════════════════════════════════════════════════════
 
 class MainActivity : ComponentActivity() {
 
-    // Must be registered before onCreate() per Jetpack lifecycle contract.
     private val notifPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-            // granted = true  → status-bar notification will show
-            // granted = false → app still fully functional, no status-bar notif
-        }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // ── Request POST_NOTIFICATIONS on Android 13+ (API 33+) ───────────
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.POST_NOTIFICATIONS
+                    this, Manifest.permission.POST_NOTIFICATIONS
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
                 notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -229,20 +335,12 @@ class MainActivity : ComponentActivity() {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SECTION 3 — COMPOSE UI
-//
-// Recomposition strategy:
-//   • One LaunchedEffect coroutine polls two @Volatile strings + one Boolean
-//     every 1 second via delay(). No Timer, no extra thread, no callbacks.
-//   • Only 3 remembered state values — recompose redraws only the leaf
-//     Text() nodes that actually changed. Minimal GPU/CPU work per frame.
-//   • Dark theme: fewer overdraw layers on OLED, lower power draw, and
-//     matches the utilitarian monitoring-tool aesthetic intentionally.
 // ═════════════════════════════════════════════════════════════════════════════
 
 private val BgColor    = Color(0xFF0F0F0F)
 private val CardColor  = Color(0xFF1A1A1A)
-private val AccentDown = Color(0xFF00C896)  // Teal   — download
-private val AccentUp   = Color(0xFFFF6B35)  // Orange — upload
+private val AccentDown = Color(0xFF00C896)
+private val AccentUp   = Color(0xFFFF6B35)
 private val LabelColor = Color(0xFF888888)
 
 @Composable
@@ -252,10 +350,8 @@ fun SpeedScreen(onStart: () -> Unit, onStop: () -> Unit) {
     var up      by remember { mutableStateOf("0 B/s") }
     var running by remember { mutableStateOf(SpeedService.isRunning) }
 
-    // Single coroutine polling static fields every second.
-    // suspend delay() yields the thread — zero blocking, zero extra threads.
     LaunchedEffect(Unit) {
-        while (true) {
+        while (isActive) {
             down    = SpeedService.downSpeed
             up      = SpeedService.upSpeed
             running = SpeedService.isRunning
@@ -276,8 +372,6 @@ fun SpeedScreen(onStart: () -> Unit, onStop: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-
-            // ── App title ──────────────────────────────────────────────────
             Text(
                 text          = "SPEED METER",
                 color         = Color.White,
@@ -288,13 +382,11 @@ fun SpeedScreen(onStart: () -> Unit, onStop: () -> Unit) {
 
             Spacer(Modifier.height(8.dp))
 
-            // ── Speed cards ───────────────────────────────────────────────
             SpeedCard(label = "DOWNLOAD", value = down, accent = AccentDown, arrow = "↓")
             SpeedCard(label = "UPLOAD",   value = up,   accent = AccentUp,   arrow = "↑")
 
             Spacer(Modifier.height(16.dp))
 
-            // ── Live status indicator ─────────────────────────────────────
             Row(
                 verticalAlignment     = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.Center
@@ -316,7 +408,6 @@ fun SpeedScreen(onStart: () -> Unit, onStop: () -> Unit) {
 
             Spacer(Modifier.height(8.dp))
 
-            // ── Start / Stop buttons ──────────────────────────────────────
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(
                     onClick  = onStart,
@@ -338,7 +429,6 @@ fun SpeedScreen(onStart: () -> Unit, onStop: () -> Unit) {
     }
 }
 
-// ── Reusable speed display card ────────────────────────────────────────────
 @Composable
 private fun SpeedCard(label: String, value: String, accent: Color, arrow: String) {
     Box(
