@@ -100,12 +100,14 @@ class SpeedService : Service() {
     // ── Paint: speed number (e.g. "1.24") ────────────────────────────────────
     // Larger textSize (52px on 128px canvas ≈ 40% of height) so the number
     // fills the icon slot and is readable at 24dp in the status bar.
+    // ISML proportions: number glyph cell ≈ 60% of 128px canvas → textSize 72f
+    // unit label ≈ 35% of canvas → textSize 44f
     private val paintNum: Paint by lazy {
         Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
             color     = AColor.WHITE
-            textAlign = Paint.Align.CENTER   // drawText x = canvas centre
+            textAlign = Paint.Align.CENTER
             typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            textSize  = 52f
+            textSize  = 90f   // was 52f
         }
     }
 
@@ -113,9 +115,9 @@ class SpeedService : Service() {
     private val paintUnit: Paint by lazy {
         Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
             color     = AColor.WHITE
-            textAlign = Paint.Align.CENTER   // drawText x = canvas centre
+            textAlign = Paint.Align.CENTER
             typeface  = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
-            textSize  = 32f
+            textSize  = 40f   // was 32f
         }
     }
 
@@ -140,7 +142,7 @@ class SpeedService : Service() {
         handler      = Handler(workerThread.looper)
 
         notifBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Internet Speed")
+            .setContentTitle("Speed Meter")
             .setOngoing(true)
             .setSilent(true)
             .setOnlyAlertOnce(true)
@@ -257,7 +259,7 @@ class SpeedService : Service() {
         val numH  = (-fmNum.ascent  + fmNum.descent)   // height of number line
         val unitH = (-fmUnit.ascent + fmUnit.descent)  // height of unit line
 
-        val gap    = 6f                                 // px between the two lines
+        val gap    = 0f                                 // px between the two lines
         val blockH = numH + gap + unitH
 
         // Top of the two-line block, vertically centred in BMP_SIZE.
@@ -277,11 +279,24 @@ class SpeedService : Service() {
     }
 
     // ── Speed formatter ───────────────────────────────────────────────────
-    private fun format(bps: Long): String = buildString {
-        when {
-            bps >= 1_048_576L -> append(String.format("%.2f", bps / 1_048_576.0)).append(" MB/s")
-            bps >= 1_024L     -> append(String.format("%.1f", bps / 1_024.0)).append(" KB/s")
-            else              -> append(bps).append(" B/s")
+    private fun format(bps: Long): String {
+        return when {
+            bps >= 1_048_576L -> {
+                val mb = bps / 1_048_576.0
+                String.format("%.1f MB/s", mb)   // keep 1 decimal for MB
+            }
+            bps >= 1_024L -> {
+                val kb = bps / 1_024.0
+
+                if (kb < 100) {
+                    String.format("%.0f KB/s", kb)  // round, no decimal (34.7 → 35)
+                } else {
+                    String.format("%.0f KB/s", kb)  // already clean (234 → 234)
+                }
+            }
+            else -> {
+                "$bps B/s"
+            }
         }
     }
 
